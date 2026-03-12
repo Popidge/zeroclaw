@@ -1,3 +1,8 @@
+use crate::agent::router::{
+    compact_message_for_local_model, frontier_edge_only_excluded_tools,
+    hybrid_requires_prompt_tool_instructions, next_frontier_lease_after_turn, resolve_turn_route,
+    HybridRouterRequest, RouterConversationContext,
+};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -1873,6 +1878,7 @@ pub(crate) async fn agent_turn(
     silent: bool,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    excluded_tools: &[String],
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -1890,7 +1896,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         None,
-        &[],
+        excluded_tools,
     )
     .await
 }
@@ -2714,6 +2720,123 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions
 }
 
+pub(crate) fn build_edge_executor_system_prompt(
+    tools_registry: &[Box<dyn Tool>],
+    native_tools: bool,
+) -> String {
+    let mut prompt = String::from(
+        "You are the ZeroClaw local edge executor. Handle short, bounded tasks with low latency. Be concise. Use tools directly when needed. If the request is too complex or ambiguous, say so briefly.\n",
+    );
+    if !native_tools {
+        prompt.push_str(&build_tool_instructions(tools_registry));
+    }
+    prompt
+}
+
+pub(crate) fn rewrite_history_for_edge_execution(
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    native_tools: bool,
+) {
+    const EDGE_HISTORY_MESSAGES: usize = 4;
+    const EDGE_MESSAGE_CHARS: usize = 600;
+
+    let mut recent_non_system: Vec<ChatMessage> = history
+        .iter()
+        .filter(|message| message.role != "system")
+        .cloned()
+        .collect();
+    if recent_non_system.len() > EDGE_HISTORY_MESSAGES {
+        recent_non_system =
+            recent_non_system[recent_non_system.len() - EDGE_HISTORY_MESSAGES..].to_vec();
+    }
+    for message in &mut recent_non_system {
+        message.content = compact_message_for_local_model(&message.content, EDGE_MESSAGE_CHARS);
+    }
+
+    history.clear();
+    history.push(ChatMessage::system(build_edge_executor_system_prompt(
+        tools_registry,
+        native_tools,
+    )));
+    history.extend(recent_non_system);
+}
+
+async fn resolve_execution_provider_for_turn(
+    config: &Config,
+    provider_name: &str,
+    requested_model: &str,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    had_prior_history: bool,
+    frontier_lease_remaining: usize,
+    channel_name: &str,
+    provider_runtime_options: &providers::ProviderRuntimeOptions,
+) -> Result<(Box<dyn Provider>, String, String, Vec<String>, usize)> {
+    if let Some(decision) = resolve_turn_route(HybridRouterRequest {
+        requested_provider: provider_name,
+        requested_model,
+        global_api_key: config.api_key.as_deref(),
+        reliability: &config.reliability,
+        hybrid: &config.hybrid,
+        router: &config.router,
+        provider_runtime_options,
+        history,
+        channel_name,
+        conversation: RouterConversationContext {
+            had_prior_history,
+            frontier_lease_remaining,
+        },
+    })
+    .await?
+    {
+        let resolved = providers::resolve_hybrid_target_from_config(
+            &config.hybrid,
+            decision.target,
+            config.api_key.as_deref(),
+        )?;
+        let provider = providers::create_hybrid_target_provider_from_resolved(
+            &resolved,
+            &config.reliability,
+            provider_runtime_options,
+        )?;
+        let excluded_tools =
+            if matches!(decision.target, crate::config::HybridRouteTarget::Frontier) {
+                frontier_edge_only_excluded_tools(&[])
+            } else {
+                rewrite_history_for_edge_execution(
+                    history,
+                    tools_registry,
+                    provider.supports_native_tools(),
+                );
+                Vec::new()
+            };
+        let next_frontier_lease =
+            next_frontier_lease_after_turn(&decision, frontier_lease_remaining);
+
+        return Ok((
+            provider,
+            decision.provider_name,
+            decision.model,
+            excluded_tools,
+            next_frontier_lease,
+        ));
+    }
+
+    Ok((
+        providers::create_runtime_provider_from_config_with_options(
+            config,
+            provider_name,
+            requested_model,
+            provider_runtime_options,
+        )?,
+        provider_name.to_string(),
+        requested_model.to_string(),
+        Vec::new(),
+        0,
+    ))
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG, peripherals) and enters either single-shot or
@@ -2808,12 +2931,9 @@ pub async fn run(
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
 
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+    let provider: Box<dyn Provider> = providers::create_runtime_provider_from_config_with_options(
+        &config,
         provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
         model_name,
         &provider_runtime_options,
     )?;
@@ -2917,10 +3037,14 @@ pub async fn run(
         "model_routing_config",
         "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
     ));
-    if !config.agents.is_empty() {
+    if !config.agents.is_empty() || config.hybrid.enabled {
         tool_descs.push((
             "delegate",
             "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
+        ));
+        tool_descs.push((
+            "delegate_batch",
+            "Delegate multiple independent or dependency-ordered subtasks to specialized agents in one call. Use when the frontier planner can offload several bounded local jobs at once.",
         ));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
@@ -2958,7 +3082,8 @@ pub async fn run(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.supports_native_tools()
+        && !hybrid_requires_prompt_tool_instructions(provider_name);
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         model_name,
@@ -2987,6 +3112,7 @@ pub async fn run(
     let start = Instant::now();
 
     let mut final_output = String::new();
+    let mut frontier_lease_remaining = 0usize;
 
     if let Some(msg) = message {
         // Auto-save user message to memory (skip short/trivial messages)
@@ -2997,34 +3123,60 @@ pub async fn run(
                 .await;
         }
 
-        // Inject memory + hardware RAG context into user message
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
-        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-        let hw_context = hardware_rag
-            .as_ref()
-            .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
-            .unwrap_or_default();
-        let context = format!("{mem_context}{hw_context}");
+        let mut router_history = vec![ChatMessage::user(&msg)];
+        let (active_provider, active_provider_name, active_model_name, excluded_tools, _) =
+            resolve_execution_provider_for_turn(
+                &config,
+                provider_name,
+                model_name,
+                &mut router_history,
+                &tools_registry,
+                false,
+                frontier_lease_remaining,
+                channel_name,
+                &provider_runtime_options,
+            )
+            .await?;
+        let is_edge_execution = active_provider_name == config.hybrid.edge.provider
+            && active_model_name == config.hybrid.edge.model;
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
+        let enriched = if is_edge_execution {
             format!("[{now}] {msg}")
         } else {
-            format!("{context}[{now}] {msg}")
+            let mem_context =
+                build_context(mem.as_ref(), &msg, config.memory.min_relevance_score).await;
+            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+            let hw_context = hardware_rag
+                .as_ref()
+                .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
+                .unwrap_or_default();
+            let context = format!("{mem_context}{hw_context}");
+            if context.is_empty() {
+                format!("[{now}] {msg}")
+            } else {
+                format!("{context}[{now}] {msg}")
+            }
         };
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+        if is_edge_execution {
+            rewrite_history_for_edge_execution(
+                &mut history,
+                &tools_registry,
+                active_provider.supports_native_tools(),
+            );
+        }
 
         let response = run_tool_call_loop(
-            provider.as_ref(),
+            active_provider.as_ref(),
             &mut history,
             &tools_registry,
             observer.as_ref(),
-            provider_name,
-            model_name,
+            &active_provider_name,
+            &active_model_name,
             temperature,
             false,
             approval_manager.as_ref(),
@@ -3034,7 +3186,7 @@ pub async fn run(
             None,
             None,
             None,
-            &[],
+            &excluded_tools,
         )
         .await?;
         final_output = response.clone();
@@ -3094,6 +3246,7 @@ pub async fn run(
 
                     history.clear();
                     history.push(ChatMessage::system(&system_prompt));
+                    frontier_lease_remaining = 0;
                     // Clear conversation and daily memory
                     let mut cleared = 0;
                     for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -3122,31 +3275,73 @@ pub async fn run(
                     .await;
             }
 
-            // Inject memory + hardware RAG context into user message
-            let mem_context =
-                build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score).await;
-            let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-            let hw_context = hardware_rag
-                .as_ref()
-                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
-                .unwrap_or_default();
-            let context = format!("{mem_context}{hw_context}");
+            let had_prior_history = history.iter().any(|message| message.role != "system");
+            let mut router_history = history.clone();
+            router_history.push(ChatMessage::user(&user_input));
+            let (
+                active_provider,
+                active_provider_name,
+                active_model_name,
+                excluded_tools,
+                next_frontier_lease_remaining,
+            ) = match resolve_execution_provider_for_turn(
+                &config,
+                provider_name,
+                model_name,
+                &mut router_history,
+                &tools_registry,
+                had_prior_history,
+                frontier_lease_remaining,
+                channel_name,
+                &provider_runtime_options,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    eprintln!("\nError: {e}\n");
+                    let _ = history.pop();
+                    continue;
+                }
+            };
+            frontier_lease_remaining = next_frontier_lease_remaining;
+            let is_edge_execution = active_provider_name == config.hybrid.edge.provider
+                && active_model_name == config.hybrid.edge.model;
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-            let enriched = if context.is_empty() {
+            let enriched = if is_edge_execution {
                 format!("[{now}] {user_input}")
             } else {
-                format!("{context}[{now}] {user_input}")
+                let mem_context =
+                    build_context(mem.as_ref(), &user_input, config.memory.min_relevance_score)
+                        .await;
+                let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+                let hw_context = hardware_rag
+                    .as_ref()
+                    .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
+                    .unwrap_or_default();
+                let context = format!("{}{hw_context}", mem_context);
+                if context.is_empty() {
+                    format!("[{now}] {user_input}")
+                } else {
+                    format!("{context}[{now}] {user_input}")
+                }
             };
-
             history.push(ChatMessage::user(&enriched));
+            if is_edge_execution {
+                rewrite_history_for_edge_execution(
+                    &mut history,
+                    &tools_registry,
+                    active_provider.supports_native_tools(),
+                );
+            }
 
             let response = match run_tool_call_loop(
-                provider.as_ref(),
+                active_provider.as_ref(),
                 &mut history,
                 &tools_registry,
                 observer.as_ref(),
-                provider_name,
-                model_name,
+                &active_provider_name,
+                &active_model_name,
                 temperature,
                 false,
                 approval_manager.as_ref(),
@@ -3156,7 +3351,7 @@ pub async fn run(
                 None,
                 None,
                 None,
-                &[],
+                &excluded_tools,
             )
             .await
             {
@@ -3265,12 +3460,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
     };
-    let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
+    let provider: Box<dyn Provider> = providers::create_runtime_provider_from_config_with_options(
+        &config,
         provider_name,
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &config.model_routes,
         &model_name,
         &provider_runtime_options,
     )?;
@@ -3343,7 +3535,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.supports_native_tools()
+        && !hybrid_requires_prompt_tool_instructions(provider_name);
     let mut system_prompt = crate::channels::build_system_prompt_with_mode(
         &config.workspace_dir,
         &model_name,
@@ -3358,36 +3551,65 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
-    let mem_context = build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
-    let rag_limit = if config.agent.compact_context { 2 } else { 5 };
-    let hw_context = hardware_rag
-        .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
-        .unwrap_or_default();
-    let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let enriched = if context.is_empty() {
+    let mut router_history = vec![ChatMessage::user(message)];
+    let (active_provider, active_provider_name, active_model_name, excluded_tools, _) =
+        resolve_execution_provider_for_turn(
+            &config,
+            provider_name,
+            &model_name,
+            &mut router_history,
+            &tools_registry,
+            false,
+            0,
+            "gateway",
+            &provider_runtime_options,
+        )
+        .await?;
+    let is_edge_execution = active_provider_name == config.hybrid.edge.provider
+        && active_model_name == config.hybrid.edge.model;
+    let enriched = if is_edge_execution {
         format!("[{now}] {message}")
     } else {
-        format!("{context}[{now}] {message}")
+        let mem_context =
+            build_context(mem.as_ref(), message, config.memory.min_relevance_score).await;
+        let rag_limit = if config.agent.compact_context { 2 } else { 5 };
+        let hw_context = hardware_rag
+            .as_ref()
+            .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
+            .unwrap_or_default();
+        let context = format!("{mem_context}{hw_context}");
+        if context.is_empty() {
+            format!("[{now}] {message}")
+        } else {
+            format!("{context}[{now}] {message}")
+        }
     };
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
+    if is_edge_execution {
+        rewrite_history_for_edge_execution(
+            &mut history,
+            &tools_registry,
+            active_provider.supports_native_tools(),
+        );
+    }
 
     agent_turn(
-        provider.as_ref(),
+        active_provider.as_ref(),
         &mut history,
         &tools_registry,
         observer.as_ref(),
-        provider_name,
-        &model_name,
+        &active_provider_name,
+        &active_model_name,
         config.default_temperature,
         true,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        &excluded_tools,
     )
     .await
 }

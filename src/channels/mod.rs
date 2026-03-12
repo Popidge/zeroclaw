@@ -67,7 +67,15 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
+use crate::agent::loop_::{
+    build_tool_instructions, rewrite_history_for_edge_execution, run_tool_call_loop,
+    scrub_credentials,
+};
+use crate::agent::router::{
+    frontier_edge_only_excluded_tools, hybrid_requires_prompt_tool_instructions,
+    next_frontier_lease_after_turn, resolve_turn_route, HybridRouterRequest,
+    RouterConversationContext,
+};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -125,6 +133,7 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+type FrontierLeaseMap = Mutex<HashMap<String, usize>>;
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -137,6 +146,11 @@ fn channel_message_timeout_budget_secs(
     let iterations = max_tool_iterations.max(1) as u64;
     let scale = iterations.min(CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP);
     message_timeout_secs.saturating_mul(scale)
+}
+
+fn frontier_lease_store() -> &'static FrontierLeaseMap {
+    static STORE: OnceLock<FrontierLeaseMap> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +187,9 @@ struct ChannelRuntimeDefaults {
     api_key: Option<String>,
     api_url: Option<String>,
     reliability: crate::config::ReliabilityConfig,
+    model_routes: Vec<crate::config::ModelRouteConfig>,
+    router: crate::config::RouterConfig,
+    hybrid: crate::config::HybridProviderConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +582,9 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
         reliability: config.reliability.clone(),
+        model_routes: config.model_routes.clone(),
+        router: config.router.clone(),
+        hybrid: config.hybrid.clone(),
     }
 }
 
@@ -592,6 +612,9 @@ fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefau
         api_key: ctx.api_key.clone(),
         api_url: ctx.api_url.clone(),
         reliability: (*ctx.reliability).clone(),
+        model_routes: Vec::new(),
+        router: crate::config::RouterConfig::default(),
+        hybrid: crate::config::HybridProviderConfig::default(),
     }
 }
 
@@ -659,11 +682,14 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let next_defaults = load_runtime_defaults_from_config_file(&config_path).await?;
-    let next_default_provider = providers::create_resilient_provider_with_options(
+    let next_default_provider = providers::create_runtime_provider_with_options(
         &next_defaults.default_provider,
+        &next_defaults.model,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
+        &next_defaults.model_routes,
+        &next_defaults.hybrid,
         &ctx.provider_runtime_options,
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
@@ -738,11 +764,32 @@ fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: Chan
     }
 }
 
+fn get_frontier_route_lease(sender_key: &str) -> usize {
+    frontier_lease_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn set_frontier_route_lease(sender_key: &str, remaining_turns: usize) {
+    let mut leases = frontier_lease_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if remaining_turns == 0 {
+        leases.remove(sender_key);
+    } else {
+        leases.insert(sender_key.to_string(), remaining_turns);
+    }
+}
+
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key);
+    set_frontier_route_lease(sender_key, 0);
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -895,14 +942,13 @@ async fn get_or_create_provider(
         None
     };
 
-    let provider = create_resilient_provider_nonblocking(
-        provider_name,
-        ctx.api_key.clone(),
-        api_url.map(ToString::to_string),
-        ctx.reliability.as_ref().clone(),
-        ctx.provider_runtime_options.clone(),
-    )
-    .await?;
+    let mut defaults = runtime_defaults_snapshot(ctx);
+    defaults.default_provider = provider_name.to_string();
+    defaults.api_url = api_url.map(ToString::to_string);
+
+    let provider =
+        create_resilient_provider_nonblocking(defaults, ctx.provider_runtime_options.clone())
+            .await?;
     let provider: Arc<dyn Provider> = Arc::from(provider);
 
     if let Err(err) = provider.warmup().await {
@@ -917,24 +963,115 @@ async fn get_or_create_provider(
 }
 
 async fn create_resilient_provider_nonblocking(
-    provider_name: &str,
-    api_key: Option<String>,
-    api_url: Option<String>,
-    reliability: crate::config::ReliabilityConfig,
+    defaults: ChannelRuntimeDefaults,
     provider_runtime_options: providers::ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
-        providers::create_resilient_provider_with_options(
-            &provider_name,
-            api_key.as_deref(),
-            api_url.as_deref(),
-            &reliability,
+        providers::create_runtime_provider_with_options(
+            &defaults.default_provider,
+            &defaults.model,
+            defaults.api_key.as_deref(),
+            defaults.api_url.as_deref(),
+            &defaults.reliability,
+            &defaults.model_routes,
+            &defaults.hybrid,
             &provider_runtime_options,
         )
     })
     .await
     .context("failed to join provider initialization task")?
+}
+
+async fn resolve_channel_execution_provider(
+    defaults: &ChannelRuntimeDefaults,
+    route: &ChannelRouteSelection,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    had_prior_history: bool,
+    frontier_lease_remaining: usize,
+    channel_name: &str,
+    provider_runtime_options: &providers::ProviderRuntimeOptions,
+) -> anyhow::Result<(Arc<dyn Provider>, String, String, Vec<String>, usize)> {
+    if let Some(decision) = resolve_turn_route(HybridRouterRequest {
+        requested_provider: route.provider.as_str(),
+        requested_model: route.model.as_str(),
+        global_api_key: defaults.api_key.as_deref(),
+        reliability: &defaults.reliability,
+        hybrid: &defaults.hybrid,
+        router: &defaults.router,
+        provider_runtime_options,
+        history,
+        channel_name,
+        conversation: RouterConversationContext {
+            had_prior_history,
+            frontier_lease_remaining,
+        },
+    })
+    .await?
+    {
+        let resolved = providers::resolve_hybrid_target_from_config(
+            &defaults.hybrid,
+            decision.target,
+            defaults.api_key.as_deref(),
+        )?;
+        let provider = providers::create_hybrid_target_provider_from_resolved(
+            &resolved,
+            &defaults.reliability,
+            provider_runtime_options,
+        )?;
+        let excluded_tools =
+            if matches!(decision.target, crate::config::HybridRouteTarget::Frontier) {
+                frontier_edge_only_excluded_tools(&[])
+            } else {
+                rewrite_history_for_edge_execution(
+                    history,
+                    tools_registry,
+                    provider.supports_native_tools(),
+                );
+                Vec::new()
+            };
+        let next_frontier_lease =
+            next_frontier_lease_after_turn(&decision, frontier_lease_remaining);
+        return Ok((
+            Arc::from(provider),
+            decision.provider_name,
+            decision.model,
+            excluded_tools,
+            next_frontier_lease,
+        ));
+    }
+
+    let provider =
+        get_or_create_provider_from_defaults(defaults, &route.provider, provider_runtime_options)
+            .await?;
+    Ok((
+        provider,
+        route.provider.clone(),
+        route.model.clone(),
+        Vec::new(),
+        0,
+    ))
+}
+
+async fn get_or_create_provider_from_defaults(
+    defaults: &ChannelRuntimeDefaults,
+    provider_name: &str,
+    provider_runtime_options: &providers::ProviderRuntimeOptions,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    let mut adjusted = defaults.clone();
+    adjusted.default_provider = provider_name.to_string();
+    adjusted.api_url = if provider_name == defaults.default_provider {
+        defaults.api_url.clone()
+    } else {
+        None
+    };
+    let provider =
+        create_resilient_provider_nonblocking(adjusted, provider_runtime_options.clone()).await?;
+    let provider: Arc<dyn Provider> = Arc::from(provider);
+    if let Err(err) = provider.warmup().await {
+        tracing::warn!(provider = provider_name, "Provider warmup failed: {err}");
+    }
+    Ok(provider)
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -1558,25 +1695,6 @@ async fn process_channel_message(
     let history_key = conversation_history_key(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
-        Ok(provider) => provider,
-        Err(err) => {
-            let safe_err = providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
-                route.provider
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(
-                        &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
-            }
-            return;
-        }
-    };
     if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
@@ -1611,11 +1729,54 @@ async fn process_channel_message(
         .get(&history_key)
         .cloned()
         .unwrap_or_default();
-    let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let prior_turns = normalize_cached_channel_turns(prior_turns_raw);
+    let system_prompt =
+        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+    let mut router_history = vec![ChatMessage::system(system_prompt.clone())];
+    router_history.extend(prior_turns.clone());
+    let frontier_lease_remaining = get_frontier_route_lease(&history_key);
+    let (
+        active_provider,
+        active_provider_name,
+        active_model_name,
+        excluded_tools,
+        next_frontier_lease_remaining,
+    ) = match resolve_channel_execution_provider(
+        &runtime_defaults,
+        &route,
+        &mut router_history,
+        ctx.tools_registry.as_ref(),
+        had_prior_history,
+        frontier_lease_remaining,
+        msg.channel.as_str(),
+        &ctx.provider_runtime_options,
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            let message = format!(
+                "⚠️ Failed to initialize provider for `{}`.\nDetails: {safe_err}",
+                route.provider
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(
+                        &SendMessage::new(message, &msg.reply_target)
+                            .in_thread(msg.thread_ts.clone()),
+                    )
+                    .await;
+            }
+            return;
+        }
+    };
+    set_frontier_route_lease(&history_key, next_frontier_lease_remaining);
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
+    let is_edge_execution = active_provider_name == runtime_defaults.hybrid.edge.provider
+        && active_model_name == runtime_defaults.hybrid.edge.model;
+    let mut prior_turns = prior_turns;
+    if !had_prior_history && !is_edge_execution {
         let memory_context =
             build_memory_context(ctx.memory.as_ref(), &msg.content, ctx.min_relevance_score).await;
         if let Some(last_turn) = prior_turns.last_mut() {
@@ -1625,10 +1786,15 @@ async fn process_channel_message(
         }
     }
 
-    let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    if is_edge_execution {
+        rewrite_history_for_edge_execution(
+            &mut history,
+            ctx.tools_registry.as_ref(),
+            active_provider.supports_native_tools(),
+        );
+    }
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -1727,6 +1893,17 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let effective_excluded_tools = if msg.channel == "cli" {
+        excluded_tools
+    } else {
+        let mut merged = ctx.non_cli_excluded_tools.as_ref().to_vec();
+        for tool in excluded_tools {
+            if !merged.iter().any(|existing| existing == &tool) {
+                merged.push(tool);
+            }
+        }
+        merged
+    };
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -1736,8 +1913,8 @@ async fn process_channel_message(
                 &mut history,
                 ctx.tools_registry.as_ref(),
                 ctx.observer.as_ref(),
-                route.provider.as_str(),
-                route.model.as_str(),
+                &active_provider_name,
+                &active_model_name,
                 runtime_defaults.temperature,
                 true,
                 None,
@@ -1747,11 +1924,7 @@ async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
+                &effective_excluded_tools,
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3035,10 +3208,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(
-            &provider_name,
-            config.api_key.clone(),
-            config.api_url.clone(),
-            config.reliability.clone(),
+            runtime_defaults_from_config(&config),
             provider_runtime_options.clone(),
         )
         .await?,
@@ -3156,10 +3326,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
     ));
-    if !config.agents.is_empty() {
+    if !config.agents.is_empty() || config.hybrid.enabled {
         tool_descs.push((
             "delegate",
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
+        ));
+        tool_descs.push((
+            "delegate_batch",
+            "Delegate multiple independent or dependency-ordered subtasks to specialized agents in one call.",
         ));
     }
 
@@ -3175,7 +3349,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.supports_native_tools()
+        && !hybrid_requires_prompt_tool_instructions(
+            config.default_provider.as_deref().unwrap_or("openrouter"),
+        );
     let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,
@@ -4580,6 +4757,9 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        model_routes: Vec::new(),
+                        router: crate::config::RouterConfig::default(),
+                        hybrid: crate::config::HybridProviderConfig::default(),
                     },
                     last_applied_stamp: None,
                 },

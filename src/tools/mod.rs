@@ -65,7 +65,7 @@ pub use cron_remove::CronRemoveTool;
 pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
-pub use delegate::DelegateTool;
+pub use delegate::{DelegateBatchTool, DelegateTool};
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -137,6 +137,65 @@ impl Tool for ArcDelegatingTool {
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+}
+
+fn local_edge_delegate_allowlist() -> Vec<String> {
+    [
+        "shell",
+        "file_read",
+        "file_write",
+        "file_edit",
+        "glob_search",
+        "content_search",
+        "pdf_read",
+        "git_operations",
+        "browser",
+        "browser_open",
+        "screenshot",
+        "image_info",
+        "web_fetch",
+        "web_search",
+        "http_request",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn build_delegate_agents(
+    root_config: &Config,
+    agents: &HashMap<String, DelegateAgentConfig>,
+) -> HashMap<String, DelegateAgentConfig> {
+    let mut delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+        .iter()
+        .map(|(name, cfg)| (name.clone(), cfg.clone()))
+        .collect();
+
+    if root_config.hybrid.enabled
+        && !root_config.hybrid.edge.provider.trim().is_empty()
+        && !root_config.hybrid.edge.model.trim().is_empty()
+        && !delegate_agents.contains_key("edge")
+    {
+        delegate_agents.insert(
+            "edge".to_string(),
+            DelegateAgentConfig {
+                provider: root_config.hybrid.edge.provider.clone(),
+                model: root_config.hybrid.edge.model.clone(),
+                system_prompt: Some(
+                    "You are the local edge executor. Perform bounded local tasks, use tools directly, and return concise results for the calling planner."
+                        .to_string(),
+                ),
+                api_key: root_config.hybrid.edge.api_key.clone(),
+                temperature: Some(0.0),
+                max_depth: 2,
+                agentic: true,
+                allowed_tools: local_edge_delegate_allowlist(),
+                max_iterations: root_config.agent.max_tool_iterations.min(8).max(1),
+            },
+        );
+    }
+
+    delegate_agents
 }
 
 /// Create the default tool registry
@@ -315,18 +374,15 @@ pub fn all_tools_with_runtime(
     }
 
     // Add delegation tool when agents are configured
-    if !agents.is_empty() {
-        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
-            .iter()
-            .map(|(name, cfg)| (name.clone(), cfg.clone()))
-            .collect();
+    let delegate_agents = build_delegate_agents(root_config, agents);
+    if !delegate_agents.is_empty() {
         let delegate_fallback_credential = fallback_api_key.and_then(|value| {
             let trimmed_value = value.trim();
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
         let delegate_tool = DelegateTool::new_with_options(
-            delegate_agents,
+            delegate_agents.clone(),
             delegate_fallback_credential,
             security.clone(),
             crate::providers::ProviderRuntimeOptions {
@@ -343,6 +399,28 @@ pub fn all_tools_with_runtime(
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
         tool_arcs.push(Arc::new(delegate_tool));
+        tool_arcs.push(Arc::new(DelegateBatchTool::new(
+            DelegateTool::new_with_options(
+                delegate_agents,
+                fallback_api_key.and_then(|value| {
+                    let trimmed_value = value.trim();
+                    (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
+                }),
+                security.clone(),
+                crate::providers::ProviderRuntimeOptions {
+                    auth_profile_override: None,
+                    provider_api_url: root_config.api_url.clone(),
+                    zeroclaw_dir: root_config
+                        .config_path
+                        .parent()
+                        .map(std::path::PathBuf::from),
+                    secrets_encrypt: root_config.secrets.encrypt,
+                    reasoning_enabled: root_config.runtime.reasoning_enabled,
+                },
+            )
+            .with_parent_tools(Arc::new(tool_arcs.clone()))
+            .with_multimodal_config(root_config.multimodal.clone()),
+        )));
     }
 
     boxed_registry_from_arcs(tool_arcs)

@@ -1,8 +1,13 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::build_edge_executor_system_prompt;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::router::{
+    frontier_edge_only_excluded_tools, next_frontier_lease_after_turn, resolve_turn_route,
+    HybridRouterRequest, RouterConversationContext,
+};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -37,6 +42,8 @@ pub struct Agent {
     classification_config: crate::config::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
+    runtime_config: Option<Config>,
+    frontier_lease_remaining: usize,
 }
 
 pub struct AgentBuilder {
@@ -58,6 +65,7 @@ pub struct AgentBuilder {
     classification_config: Option<crate::config::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
     route_model_by_hint: Option<HashMap<String, String>>,
+    runtime_config: Option<Config>,
 }
 
 impl AgentBuilder {
@@ -81,6 +89,7 @@ impl AgentBuilder {
             classification_config: None,
             available_hints: None,
             route_model_by_hint: None,
+            runtime_config: None,
         }
     }
 
@@ -180,6 +189,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn runtime_config(mut self, runtime_config: Config) -> Self {
+        self.runtime_config = Some(runtime_config);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let tools = self
             .tools
@@ -223,6 +237,8 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
+            runtime_config: self.runtime_config,
+            frontier_lease_remaining: 0,
         })
     }
 }
@@ -238,6 +254,7 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.frontier_lease_remaining = 0;
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -293,14 +310,19 @@ impl Agent {
             .unwrap_or("anthropic/claude-sonnet-4-20250514")
             .to_string();
 
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
-            provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-        )?;
+        let provider: Box<dyn Provider> =
+            providers::create_runtime_provider_from_config_with_options(
+                config,
+                provider_name,
+                &model_name,
+                &providers::ProviderRuntimeOptions {
+                    auth_profile_override: None,
+                    provider_api_url: config.api_url.clone(),
+                    zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+                    secrets_encrypt: config.secrets.encrypt,
+                    reasoning_enabled: config.runtime.reasoning_enabled,
+                },
+            )?;
 
         let dispatcher_choice = config.agent.tool_dispatcher.as_str();
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
@@ -342,6 +364,7 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .runtime_config(config.clone())
             .build()
     }
 
@@ -372,8 +395,11 @@ impl Agent {
         self.history.extend(other_messages);
     }
 
-    fn build_system_prompt(&self) -> Result<String> {
-        let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+    fn build_system_prompt_for_dispatcher(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> Result<String> {
+        let instructions = dispatcher.prompt_instructions(&self.tools);
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
@@ -386,8 +412,28 @@ impl Agent {
         self.prompt_builder.build(&ctx)
     }
 
-    async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
+    fn build_system_prompt(&self) -> Result<String> {
+        self.build_system_prompt_for_dispatcher(self.tool_dispatcher.as_ref())
+    }
+
+    async fn execute_tool_call_with_blocked(
+        &self,
+        call: &ParsedToolCall,
+        blocked_tools: &std::collections::HashSet<String>,
+    ) -> ToolExecutionResult {
         let start = Instant::now();
+
+        if blocked_tools.contains(call.name.as_str()) {
+            return ToolExecutionResult {
+                name: call.name.clone(),
+                output: format!(
+                    "Error: tool '{}' is restricted on the current frontier route; delegate it to the local edge agent instead.",
+                    call.name
+                ),
+                success: false,
+                tool_call_id: call.tool_call_id.clone(),
+            };
+        }
 
         let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
             match tool.execute(call.arguments.clone()).await {
@@ -424,18 +470,25 @@ impl Agent {
         }
     }
 
-    async fn execute_tools(&self, calls: &[ParsedToolCall]) -> Vec<ToolExecutionResult> {
+    async fn execute_tools(
+        &self,
+        calls: &[ParsedToolCall],
+        blocked_tools: &std::collections::HashSet<String>,
+    ) -> Vec<ToolExecutionResult> {
         if !self.config.parallel_tools {
             let mut results = Vec::with_capacity(calls.len());
             for call in calls {
-                results.push(self.execute_tool_call(call).await);
+                results.push(
+                    self.execute_tool_call_with_blocked(call, blocked_tools)
+                        .await,
+                );
             }
             return results;
         }
 
         let futs: Vec<_> = calls
             .iter()
-            .map(|call| self.execute_tool_call(call))
+            .map(|call| self.execute_tool_call_with_blocked(call, blocked_tools))
             .collect();
         futures_util::future::join_all(futs).await
     }
@@ -465,14 +518,6 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
-        if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
-            self.history
-                .push(ConversationMessage::Chat(ChatMessage::system(
-                    system_prompt,
-                )));
-        }
-
         if self.auto_save {
             let _ = self
                 .memory
@@ -480,38 +525,194 @@ impl Agent {
                 .await;
         }
 
-        let context = self
-            .memory_loader
-            .load_context(self.memory.as_ref(), user_message)
-            .await
-            .unwrap_or_default();
+        let effective_model = self.classify_model(user_message);
+        let had_prior_history = self.history.iter().any(|message| {
+            matches!(
+                message,
+                ConversationMessage::Chat(chat) if chat.role != "system"
+            )
+        });
+        let mut pending_history = self.history.clone();
+        pending_history.push(ConversationMessage::Chat(ChatMessage::user(user_message)));
 
+        let (
+            owned_active_provider,
+            _active_provider_name,
+            active_model_name,
+            active_dispatcher,
+            blocked_tools,
+        ) = if let Some(runtime_config) = self.runtime_config.as_ref() {
+            let provider_runtime_options = providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                provider_api_url: runtime_config.api_url.clone(),
+                zeroclaw_dir: runtime_config
+                    .config_path
+                    .parent()
+                    .map(std::path::PathBuf::from),
+                secrets_encrypt: runtime_config.secrets.encrypt,
+                reasoning_enabled: runtime_config.runtime.reasoning_enabled,
+            };
+            let requested_provider = runtime_config
+                .default_provider
+                .as_deref()
+                .unwrap_or("openrouter");
+            let router_history = self.tool_dispatcher.to_provider_messages(&pending_history);
+            if let Some(decision) = resolve_turn_route(HybridRouterRequest {
+                requested_provider,
+                requested_model: &effective_model,
+                global_api_key: runtime_config.api_key.as_deref(),
+                reliability: &runtime_config.reliability,
+                hybrid: &runtime_config.hybrid,
+                router: &runtime_config.router,
+                provider_runtime_options: &provider_runtime_options,
+                history: &router_history,
+                channel_name: "agent",
+                conversation: RouterConversationContext {
+                    had_prior_history,
+                    frontier_lease_remaining: self.frontier_lease_remaining,
+                },
+            })
+            .await?
+            {
+                let resolved = providers::resolve_hybrid_target_from_config(
+                    &runtime_config.hybrid,
+                    decision.target,
+                    runtime_config.api_key.as_deref(),
+                )?;
+                let provider = providers::create_hybrid_target_provider_from_resolved(
+                    &resolved,
+                    &runtime_config.reliability,
+                    &provider_runtime_options,
+                )?;
+                let dispatcher: Box<dyn ToolDispatcher> =
+                    match runtime_config.agent.tool_dispatcher.as_str() {
+                        "native" => Box::new(NativeToolDispatcher),
+                        "xml" => Box::new(XmlToolDispatcher),
+                        _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+                        _ => Box::new(XmlToolDispatcher),
+                    };
+                let blocked =
+                    if matches!(decision.target, crate::config::HybridRouteTarget::Frontier) {
+                        frontier_edge_only_excluded_tools(&[])
+                            .into_iter()
+                            .collect::<std::collections::HashSet<_>>()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+                self.frontier_lease_remaining =
+                    next_frontier_lease_after_turn(&decision, self.frontier_lease_remaining);
+                (
+                    Some(provider),
+                    decision.provider_name,
+                    decision.model,
+                    dispatcher,
+                    blocked,
+                )
+            } else {
+                self.frontier_lease_remaining = 0;
+                let provider = providers::create_runtime_provider_from_config_with_options(
+                    runtime_config,
+                    requested_provider,
+                    &effective_model,
+                    &provider_runtime_options,
+                )?;
+                let dispatcher: Box<dyn ToolDispatcher> =
+                    match runtime_config.agent.tool_dispatcher.as_str() {
+                        "native" => Box::new(NativeToolDispatcher),
+                        "xml" => Box::new(XmlToolDispatcher),
+                        _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+                        _ => Box::new(XmlToolDispatcher),
+                    };
+                (
+                    Some(provider),
+                    requested_provider.to_string(),
+                    effective_model.clone(),
+                    dispatcher,
+                    std::collections::HashSet::new(),
+                )
+            }
+        } else {
+            let dispatcher: Box<dyn ToolDispatcher> = match self.config.tool_dispatcher.as_str() {
+                "native" => Box::new(NativeToolDispatcher),
+                "xml" => Box::new(XmlToolDispatcher),
+                _ if self.provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+                _ => Box::new(XmlToolDispatcher),
+            };
+            (
+                None,
+                self.runtime_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.default_provider.clone())
+                    .unwrap_or_else(|| "openrouter".to_string()),
+                effective_model.clone(),
+                dispatcher,
+                std::collections::HashSet::new(),
+            )
+        };
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
+        let is_edge_execution = self.runtime_config.as_ref().is_some_and(|cfg| {
+            _active_provider_name == cfg.hybrid.edge.provider
+                && active_model_name == cfg.hybrid.edge.model
+        });
+        let enriched = if is_edge_execution {
             format!("[{now}] {user_message}")
         } else {
-            format!("{context}[{now}] {user_message}")
+            let context = self
+                .memory_loader
+                .load_context(self.memory.as_ref(), user_message)
+                .await
+                .unwrap_or_default();
+            if context.is_empty() {
+                format!("[{now}] {user_message}")
+            } else {
+                format!("{context}[{now}] {user_message}")
+            }
         };
-
+        let system_prompt = if is_edge_execution {
+            build_edge_executor_system_prompt(
+                &self.tools,
+                owned_active_provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.supports_native_tools()),
+            )
+        } else {
+            self.build_system_prompt_for_dispatcher(active_dispatcher.as_ref())?
+        };
+        if let Some(ConversationMessage::Chat(chat)) = self.history.iter_mut().find(
+            |message| matches!(message, ConversationMessage::Chat(chat) if chat.role == "system"),
+        ) {
+            *chat = ChatMessage::system(system_prompt.clone());
+        } else {
+            self.history.insert(
+                0,
+                ConversationMessage::Chat(ChatMessage::system(system_prompt)),
+            );
+        }
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let filtered_tool_specs: Vec<ToolSpec> = self
+            .tool_specs
+            .iter()
+            .filter(|spec| !blocked_tools.contains(spec.name.as_str()))
+            .cloned()
+            .collect();
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let response = match self
-                .provider
+            let messages = active_dispatcher.to_provider_messages(&self.history);
+            let response = match owned_active_provider
+                .as_deref()
+                .unwrap_or(self.provider.as_ref())
                 .chat(
                     ChatRequest {
                         messages: &messages,
-                        tools: if self.tool_dispatcher.should_send_tool_specs() {
-                            Some(&self.tool_specs)
+                        tools: if active_dispatcher.should_send_tool_specs() {
+                            Some(filtered_tool_specs.as_slice())
                         } else {
                             None
                         },
                     },
-                    &effective_model,
+                    &active_model_name,
                     self.temperature,
                 )
                 .await
@@ -520,7 +721,7 @@ impl Agent {
                 Err(err) => return Err(err),
             };
 
-            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let (text, calls) = active_dispatcher.parse_response(&response);
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
@@ -552,8 +753,8 @@ impl Agent {
                 reasoning_content: response.reasoning_content.clone(),
             });
 
-            let results = self.execute_tools(&calls).await;
-            let formatted = self.tool_dispatcher.format_results(&results);
+            let results = self.execute_tools(&calls, &blocked_tools).await;
+            let formatted = active_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();
         }

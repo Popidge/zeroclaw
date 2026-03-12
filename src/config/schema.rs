@@ -118,6 +118,14 @@ pub struct Config {
     #[serde(default)]
     pub skills: SkillsConfig,
 
+    /// Router role configuration (`[router]`).
+    #[serde(default)]
+    pub router: RouterConfig,
+
+    /// Hybrid edge/frontier provider coordination (`[hybrid]`).
+    #[serde(default)]
+    pub hybrid: HybridProviderConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -234,6 +242,143 @@ pub struct ModelProviderConfig {
     /// If true, load OpenAI auth material (OPENAI_API_KEY or ~/.codex/auth.json).
     #[serde(default)]
     pub requires_openai_auth: bool,
+}
+
+// ── Hybrid Provider ──────────────────────────────────────────────
+
+/// Hybrid provider routing target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HybridRouteTarget {
+    Edge,
+    #[default]
+    Frontier,
+}
+
+fn default_router_temperature() -> f64 {
+    0.0
+}
+
+fn default_router_confidence_threshold() -> f64 {
+    0.7
+}
+
+fn default_router_timeout_ms() -> u64 {
+    4_000
+}
+
+fn default_router_max_messages() -> usize {
+    12
+}
+
+fn default_router_max_chars() -> usize {
+    6_000
+}
+
+/// Dedicated router role configuration.
+///
+/// In v1 this defaults to inheriting the edge executor provider/model unless
+/// explicitly overridden, which preserves a clean drop-in path for a future
+/// specialized router model.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RouterConfig {
+    /// Optional provider override for the router role. Defaults to `hybrid.edge.provider`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional model override for the router role. Defaults to `hybrid.edge.model`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional API key override for the router role.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional API base URL override for the router role.
+    #[serde(default)]
+    pub api_url: Option<String>,
+    /// Temperature used by the router model. Default: `0.0`.
+    #[serde(default = "default_router_temperature")]
+    pub temperature: f64,
+    /// Minimum confidence required to trust the router output.
+    #[serde(default = "default_router_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// Router timeout budget in milliseconds.
+    #[serde(default = "default_router_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum number of recent messages included in the router transcript.
+    #[serde(default = "default_router_max_messages")]
+    pub max_messages: usize,
+    /// Maximum characters included in the router transcript.
+    #[serde(default = "default_router_max_chars")]
+    pub max_chars: usize,
+    /// Optional custom system prompt for the router role.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            api_key: None,
+            api_url: None,
+            temperature: default_router_temperature(),
+            confidence_threshold: default_router_confidence_threshold(),
+            timeout_ms: default_router_timeout_ms(),
+            max_messages: default_router_max_messages(),
+            max_chars: default_router_max_chars(),
+            system_prompt: None,
+        }
+    }
+}
+
+/// Provider/model pair used by the hybrid coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct HybridTargetConfig {
+    /// Provider name for this target (for example "lmstudio" or "openrouter").
+    #[serde(default)]
+    pub provider: String,
+    /// Model name for this target.
+    #[serde(default)]
+    pub model: String,
+    /// Optional API key override for this target.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional API base URL override for this target.
+    #[serde(default)]
+    pub api_url: Option<String>,
+}
+
+/// Basic routing fallback settings for the hybrid provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HybridClassifierConfig {
+    /// Fallback target used when classifier output is invalid or unavailable.
+    #[serde(default)]
+    pub fallback_target: HybridRouteTarget,
+}
+
+impl Default for HybridClassifierConfig {
+    fn default() -> Self {
+        Self {
+            fallback_target: HybridRouteTarget::Frontier,
+        }
+    }
+}
+
+/// Hybrid edge/frontier provider configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct HybridProviderConfig {
+    /// Enable the hybrid provider harness.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Edge model used for lightweight requests and request classification.
+    #[serde(default)]
+    pub edge: HybridTargetConfig,
+    /// Frontier model used for harder reasoning and planning.
+    #[serde(default)]
+    pub frontier: HybridTargetConfig,
+    /// Classifier policy used to choose between edge and frontier.
+    #[serde(default)]
+    pub classifier: HybridClassifierConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -3586,6 +3731,8 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
             skills: SkillsConfig::default(),
+            router: RouterConfig::default(),
+            hybrid: HybridProviderConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
@@ -4282,6 +4429,11 @@ impl Config {
             if route.model.trim().is_empty() {
                 anyhow::bail!("model_routes[{i}].model must not be empty");
             }
+            if route.provider.trim().eq_ignore_ascii_case("hybrid") {
+                anyhow::bail!(
+                    "model_routes[{i}].provider cannot be 'hybrid'; route directly to a concrete provider"
+                );
+            }
         }
 
         // Embedding routes
@@ -4295,6 +4447,56 @@ impl Config {
             if route.model.trim().is_empty() {
                 anyhow::bail!("embedding_routes[{i}].model must not be empty");
             }
+        }
+
+        if self.default_provider.as_deref() == Some("hybrid") && !self.hybrid.enabled {
+            anyhow::bail!("default_provider 'hybrid' requires [hybrid].enabled = true");
+        }
+
+        if self.hybrid.enabled {
+            for (name, target) in [
+                ("hybrid.edge", &self.hybrid.edge),
+                ("hybrid.frontier", &self.hybrid.frontier),
+            ] {
+                if target.provider.trim().is_empty() {
+                    anyhow::bail!("{name}.provider must not be empty when hybrid is enabled");
+                }
+                if target.model.trim().is_empty() {
+                    anyhow::bail!("{name}.model must not be empty when hybrid is enabled");
+                }
+                if target.provider.trim().eq_ignore_ascii_case("hybrid") {
+                    anyhow::bail!("{name}.provider cannot be 'hybrid'");
+                }
+            }
+
+            if self
+                .router
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| value.eq_ignore_ascii_case("hybrid"))
+            {
+                anyhow::bail!("router.provider cannot be 'hybrid'");
+            }
+        } else if self.router.provider.is_some()
+            || self.router.model.is_some()
+            || self.router.api_key.is_some()
+            || self.router.api_url.is_some()
+        {
+            anyhow::bail!("router config requires [hybrid].enabled = true");
+        }
+
+        if !(0.0..=1.0).contains(&self.router.confidence_threshold) {
+            anyhow::bail!("router.confidence_threshold must be between 0.0 and 1.0");
+        }
+        if self.router.timeout_ms == 0 {
+            anyhow::bail!("router.timeout_ms must be greater than 0");
+        }
+        if self.router.max_messages == 0 {
+            anyhow::bail!("router.max_messages must be greater than 0");
+        }
+        if self.router.max_chars == 0 {
+            anyhow::bail!("router.max_chars must be greater than 0");
         }
 
         for (profile_key, profile) in &self.model_providers {
@@ -5081,6 +5283,8 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            router: RouterConfig::default(),
+            hybrid: HybridProviderConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -5299,6 +5503,8 @@ tool_dispatcher = "xml"
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            router: RouterConfig::default(),
+            hybrid: HybridProviderConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),

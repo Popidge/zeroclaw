@@ -1,13 +1,15 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::config::DelegateAgentConfig;
+use crate::observability::runtime_trace;
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +22,7 @@ const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
 /// provider/model configuration. Enables multi-agent workflows where
 /// a primary agent can hand off specialized work (research, coding,
 /// summarization) to purpose-built sub-agents.
+#[derive(Clone)]
 pub struct DelegateTool {
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -33,6 +36,30 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
+}
+
+#[derive(Clone)]
+pub struct DelegateBatchTool {
+    delegate: DelegateTool,
+}
+
+#[derive(Clone, Debug)]
+struct DelegateBatchJob {
+    id: String,
+    agent: String,
+    prompt: String,
+    context: String,
+    depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DelegateBatchJobResult {
+    id: String,
+    agent: String,
+    success: bool,
+    output: String,
+    error: Option<String>,
+    depends_on: Vec<String>,
 }
 
 impl DelegateTool {
@@ -112,6 +139,12 @@ impl DelegateTool {
     pub fn with_multimodal_config(mut self, config: crate::config::MultimodalConfig) -> Self {
         self.multimodal_config = config;
         self
+    }
+}
+
+impl DelegateBatchTool {
+    pub fn new(delegate: DelegateTool) -> Self {
+        Self { delegate }
     }
 }
 
@@ -339,6 +372,276 @@ impl Tool for DelegateTool {
     }
 }
 
+#[async_trait]
+impl Tool for DelegateBatchTool {
+    fn name(&self) -> &str {
+        "delegate_batch"
+    }
+
+    fn description(&self) -> &str {
+        "Delegate multiple subtasks to named agents. Independent jobs run concurrently; dependency edges enforce ordering."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "jobs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1},
+                            "agent": {"type": "string", "minLength": 1},
+                            "prompt": {"type": "string", "minLength": 1},
+                            "context": {"type": "string"},
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string", "minLength": 1}
+                            }
+                        },
+                        "required": ["id", "agent", "prompt"]
+                    }
+                }
+            },
+            "required": ["jobs"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let jobs_value = args
+            .get("jobs")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("Missing 'jobs' array parameter"))?;
+
+        let mut jobs = Vec::with_capacity(jobs_value.len());
+        let mut seen_ids = HashSet::new();
+        for item in jobs_value {
+            let id = item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Each delegate_batch job requires a non-empty 'id'")
+                })?;
+            if !seen_ids.insert(id.to_string()) {
+                anyhow::bail!("delegate_batch job ids must be unique; duplicate '{id}'");
+            }
+            let agent = item
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("delegate_batch job '{id}' requires a non-empty 'agent'")
+                })?;
+            let prompt = item
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("delegate_batch job '{id}' requires a non-empty 'prompt'")
+                })?;
+            let context = item
+                .get("context")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let depends_on = item
+                .get("depends_on")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            jobs.push(DelegateBatchJob {
+                id: id.to_string(),
+                agent: agent.to_string(),
+                prompt: prompt.to_string(),
+                context,
+                depends_on,
+            });
+        }
+
+        for job in &jobs {
+            for dependency in &job.depends_on {
+                if !seen_ids.contains(dependency) {
+                    anyhow::bail!(
+                        "delegate_batch job '{}' depends on unknown job '{}'",
+                        job.id,
+                        dependency
+                    );
+                }
+            }
+        }
+
+        runtime_trace::record_event(
+            "delegate_batch_start",
+            Some("delegate_batch"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            json!({
+                "job_count": jobs.len(),
+                "job_ids": jobs.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+            }),
+        );
+
+        let original_order: Vec<String> = jobs.iter().map(|job| job.id.clone()).collect();
+        let mut pending: HashMap<String, DelegateBatchJob> =
+            jobs.into_iter().map(|job| (job.id.clone(), job)).collect();
+        let mut completed: HashMap<String, DelegateBatchJobResult> = HashMap::new();
+
+        while !pending.is_empty() {
+            let ready_ids: Vec<String> = pending
+                .values()
+                .filter(|job| job.depends_on.iter().all(|dep| completed.contains_key(dep)))
+                .map(|job| job.id.clone())
+                .collect();
+
+            if ready_ids.is_empty() {
+                let blocked = pending.keys().cloned().collect::<Vec<_>>();
+                anyhow::bail!(
+                    "delegate_batch dependency cycle or deadlock detected among jobs: {}",
+                    blocked.join(", ")
+                );
+            }
+
+            let ready_jobs: Vec<DelegateBatchJob> = ready_ids
+                .iter()
+                .filter_map(|id| pending.remove(id))
+                .collect();
+
+            let delegate = self.delegate.clone();
+            let executions = ready_jobs.into_iter().map(move |job| {
+                let delegate = delegate.clone();
+                async move {
+                    runtime_trace::record_event(
+                        "delegate_batch_job_start",
+                        Some("delegate_batch"),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        json!({
+                            "job_id": job.id.clone(),
+                            "agent": job.agent.clone(),
+                            "depends_on": job.depends_on.clone(),
+                        }),
+                    );
+                    let tool_result = delegate
+                        .execute(json!({
+                            "agent": job.agent.clone(),
+                            "prompt": job.prompt.clone(),
+                            "context": job.context.clone(),
+                        }))
+                        .await;
+                    match tool_result {
+                        Ok(result) => DelegateBatchJobResult {
+                            id: job.id,
+                            agent: job.agent,
+                            success: result.success,
+                            output: result.output,
+                            error: result.error,
+                            depends_on: job.depends_on,
+                        },
+                        Err(error) => DelegateBatchJobResult {
+                            id: job.id,
+                            agent: job.agent,
+                            success: false,
+                            output: String::new(),
+                            error: Some(error.to_string()),
+                            depends_on: job.depends_on,
+                        },
+                    }
+                }
+            });
+
+            for result in join_all(executions).await {
+                runtime_trace::record_event(
+                    "delegate_batch_job_result",
+                    Some("delegate_batch"),
+                    None,
+                    None,
+                    None,
+                    Some(result.success),
+                    result.error.as_deref(),
+                    json!({
+                        "job_id": result.id,
+                        "agent": result.agent,
+                        "depends_on": result.depends_on,
+                        "output": result.output,
+                    }),
+                );
+                completed.insert(result.id.clone(), result);
+            }
+        }
+
+        let ordered_results: Vec<&DelegateBatchJobResult> = original_order
+            .iter()
+            .filter_map(|id| completed.get(id))
+            .collect();
+        let success_count = ordered_results.iter().filter(|job| job.success).count();
+        let failure_count = ordered_results.len().saturating_sub(success_count);
+        runtime_trace::record_event(
+            "delegate_batch_complete",
+            Some("delegate_batch"),
+            None,
+            None,
+            None,
+            Some(failure_count == 0),
+            None,
+            json!({
+                "job_count": ordered_results.len(),
+                "success_count": success_count,
+                "failure_count": failure_count,
+            }),
+        );
+
+        Ok(ToolResult {
+            success: failure_count == 0,
+            output: serde_json::to_string_pretty(&json!({
+                "results": ordered_results.iter().map(|job| {
+                    json!({
+                        "id": job.id,
+                        "agent": job.agent,
+                        "success": job.success,
+                        "output": job.output,
+                        "error": job.error,
+                        "depends_on": job.depends_on,
+                    })
+                }).collect::<Vec<_>>(),
+                "summary": {
+                    "job_count": ordered_results.len(),
+                    "success_count": success_count,
+                    "failure_count": failure_count,
+                }
+            }))?,
+            error: (failure_count > 0).then(|| {
+                format!(
+                    "{failure_count} delegate_batch job(s) failed; inspect per-job results for details"
+                )
+            }),
+        })
+    }
+}
+
 impl DelegateTool {
     async fn execute_agentic(
         &self,
@@ -538,6 +841,10 @@ mod tests {
         agents
     }
 
+    fn sample_delegate_batch_tool() -> DelegateBatchTool {
+        DelegateBatchTool::new(DelegateTool::new(sample_agents(), None, test_security()))
+    }
+
     #[derive(Default)]
     struct EchoTool;
 
@@ -706,6 +1013,15 @@ mod tests {
     }
 
     #[test]
+    fn delegate_batch_name_and_schema() {
+        let tool = sample_delegate_batch_tool();
+        assert_eq!(tool.name(), "delegate_batch");
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["required"][0], json!("jobs"));
+    }
+
+    #[test]
     fn description_not_empty() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
         assert!(!tool.description().is_empty());
@@ -845,6 +1161,45 @@ mod tests {
                     .unwrap_or("")
                     .contains("Unknown agent")
         );
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_rejects_unknown_dependencies() {
+        let tool = sample_delegate_batch_tool();
+        let result = tool
+            .execute(json!({
+                "jobs": [{
+                    "id": "job-1",
+                    "agent": "researcher",
+                    "prompt": "test",
+                    "depends_on": ["missing-job"]
+                }]
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("depends on unknown job"));
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_reports_unknown_agent_failures() {
+        let tool = sample_delegate_batch_tool();
+        let result = tool
+            .execute(json!({
+                "jobs": [{
+                    "id": "job-1",
+                    "agent": "missing",
+                    "prompt": "test"
+                }]
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("\"id\": \"job-1\""));
+        assert!(result.output.contains("Unknown agent 'missing'"));
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ pub mod bedrock;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
+pub mod hybrid;
 pub mod ollama;
 pub mod openai;
 pub mod openai_codex;
@@ -37,7 +38,9 @@ pub use traits::{
 };
 
 use crate::auth::AuthService;
+use crate::config::{Config, HybridProviderConfig, HybridRouteTarget, RouterConfig};
 use compatible::{AuthStyle, OpenAiCompatibleProvider};
+use hybrid::{HybridProvider, HybridResolvedRouter, HybridResolvedTarget};
 use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -1510,6 +1513,123 @@ pub fn create_routed_provider_with_options(
     )))
 }
 
+pub fn create_hybrid_target_provider_from_resolved(
+    target: &HybridResolvedTarget,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    create_resilient_provider_with_options(
+        target.provider_name.as_str(),
+        target.api_key.as_deref(),
+        target.api_url.as_deref(),
+        reliability,
+        options,
+    )
+}
+
+pub fn create_router_provider_from_resolved(
+    target: &HybridResolvedRouter,
+    reliability: &crate::config::ReliabilityConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    create_resilient_provider_with_options(
+        target.provider_name.as_str(),
+        target.api_key.as_deref(),
+        target.api_url.as_deref(),
+        reliability,
+        options,
+    )
+}
+
+pub fn resolve_hybrid_target_from_config(
+    hybrid: &HybridProviderConfig,
+    target: HybridRouteTarget,
+    global_api_key: Option<&str>,
+) -> anyhow::Result<HybridResolvedTarget> {
+    hybrid::resolve_hybrid_target(hybrid, target, global_api_key)
+}
+
+pub fn resolve_router_target_from_config(
+    router: &RouterConfig,
+    hybrid: &HybridProviderConfig,
+    global_api_key: Option<&str>,
+) -> anyhow::Result<HybridResolvedRouter> {
+    hybrid::resolve_router_target(router, hybrid, global_api_key)
+}
+
+pub fn create_hybrid_provider_with_options(
+    global_api_key: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    hybrid: &HybridProviderConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    if !hybrid.enabled {
+        anyhow::bail!("provider 'hybrid' requires [hybrid].enabled = true");
+    }
+
+    let edge_target =
+        resolve_hybrid_target_from_config(hybrid, HybridRouteTarget::Edge, global_api_key)?;
+    let frontier_target =
+        resolve_hybrid_target_from_config(hybrid, HybridRouteTarget::Frontier, global_api_key)?;
+    let edge_provider =
+        create_hybrid_target_provider_from_resolved(&edge_target, reliability, options)?;
+    let frontier_provider =
+        create_hybrid_target_provider_from_resolved(&frontier_target, reliability, options)?;
+
+    Ok(Box::new(HybridProvider::new(
+        edge_target.provider_name,
+        edge_target.model,
+        edge_provider,
+        frontier_target.provider_name,
+        frontier_target.model,
+        frontier_provider,
+        hybrid.classifier.fallback_target,
+    )))
+}
+
+pub fn create_runtime_provider_with_options(
+    provider_name: &str,
+    default_model: &str,
+    global_api_key: Option<&str>,
+    global_api_url: Option<&str>,
+    reliability: &crate::config::ReliabilityConfig,
+    model_routes: &[crate::config::ModelRouteConfig],
+    hybrid: &HybridProviderConfig,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    if provider_name.trim().eq_ignore_ascii_case("hybrid") {
+        return create_hybrid_provider_with_options(global_api_key, reliability, hybrid, options);
+    }
+
+    create_routed_provider_with_options(
+        provider_name,
+        global_api_key,
+        global_api_url,
+        reliability,
+        model_routes,
+        default_model,
+        options,
+    )
+}
+
+pub fn create_runtime_provider_from_config_with_options(
+    config: &Config,
+    provider_name: &str,
+    default_model: &str,
+    options: &ProviderRuntimeOptions,
+) -> anyhow::Result<Box<dyn Provider>> {
+    create_runtime_provider_with_options(
+        provider_name,
+        default_model,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        &config.hybrid,
+        options,
+    )
+}
+
 /// Information about a supported provider for display purposes.
 pub struct ProviderInfo {
     /// Canonical name used in config (e.g. `"openrouter"`)
@@ -1533,6 +1653,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "openrouter",
             display_name: "OpenRouter",
             aliases: &[],
+            local: false,
+        },
+        ProviderInfo {
+            name: "hybrid",
+            display_name: "Hybrid Coordinator",
+            aliases: &["edge-frontier", "hybrid-provider"],
             local: false,
         },
         ProviderInfo {

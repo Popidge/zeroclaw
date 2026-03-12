@@ -713,6 +713,9 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     for agent in masked.agents.values_mut() {
         mask_optional_secret(&mut agent.api_key);
     }
+    mask_optional_secret(&mut masked.router.api_key);
+    mask_optional_secret(&mut masked.hybrid.edge.api_key);
+    mask_optional_secret(&mut masked.hybrid.frontier.api_key);
     for route in &mut masked.model_routes {
         mask_optional_secret(&mut route.api_key);
     }
@@ -837,6 +840,15 @@ fn restore_masked_sensitive_fields(
             restore_optional_secret(&mut agent.api_key, &current_agent.api_key);
         }
     }
+    restore_optional_secret(&mut incoming.router.api_key, &current.router.api_key);
+    restore_optional_secret(
+        &mut incoming.hybrid.edge.api_key,
+        &current.hybrid.edge.api_key,
+    );
+    restore_optional_secret(
+        &mut incoming.hybrid.frontier.api_key,
+        &current.hybrid.frontier.api_key,
+    );
     restore_model_route_api_keys(&mut incoming.model_routes, &current.model_routes);
     restore_embedding_route_api_keys(&mut incoming.embedding_routes, &current.embedding_routes);
 

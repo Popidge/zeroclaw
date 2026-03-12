@@ -12,6 +12,7 @@ pub mod sse;
 pub mod static_files;
 pub mod ws;
 
+use crate::agent::router::{resolve_turn_route, HybridRouterRequest, RouterConversationContext};
 use crate::channels::{
     Channel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
 };
@@ -338,19 +339,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
-        config.api_key.as_deref(),
-        config.api_url.as_deref(),
-        &config.reliability,
-        &providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            provider_api_url: config.api_url.clone(),
-            zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
-            secrets_encrypt: config.secrets.encrypt,
-            reasoning_enabled: config.runtime.reasoning_enabled,
-        },
-    )?);
+    let provider: Arc<dyn Provider> =
+        Arc::from(providers::create_runtime_provider_from_config_with_options(
+            &config,
+            config.default_provider.as_deref().unwrap_or("openrouter"),
+            config
+                .default_model
+                .as_deref()
+                .unwrap_or("anthropic/claude-sonnet-4"),
+            &providers::ProviderRuntimeOptions {
+                auth_profile_override: None,
+                provider_api_url: config.api_url.clone(),
+                zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+                secrets_encrypt: config.secrets.encrypt,
+                reasoning_enabled: config.runtime.reasoning_enabled,
+            },
+        )?);
     let model = config
         .default_model
         .clone()
@@ -845,6 +849,15 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
         )
     };
 
+    let config = state.config.lock().clone();
+    let provider_runtime_options = providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        provider_api_url: config.api_url.clone(),
+        zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+    };
+
     let mut messages = Vec::with_capacity(1 + user_messages.len());
     messages.push(ChatMessage::system(system_prompt));
     messages.extend(user_messages);
@@ -853,9 +866,70 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     let prepared =
         crate::multimodal::prepare_messages_for_provider(&messages, &multimodal_config).await?;
 
-    state
-        .provider
-        .chat_with_history(&prepared.messages, &state.model, state.temperature)
+    let (provider, provider_name, model_name) = if let Some(decision) =
+        resolve_turn_route(HybridRouterRequest {
+            requested_provider: config.default_provider.as_deref().unwrap_or("openrouter"),
+            requested_model: config
+                .default_model
+                .as_deref()
+                .unwrap_or("anthropic/claude-sonnet-4"),
+            global_api_key: config.api_key.as_deref(),
+            reliability: &config.reliability,
+            hybrid: &config.hybrid,
+            router: &config.router,
+            provider_runtime_options: &provider_runtime_options,
+            history: &messages,
+            channel_name: "gateway",
+            conversation: RouterConversationContext {
+                had_prior_history: false,
+                frontier_lease_remaining: 0,
+            },
+        })
+        .await?
+    {
+        let resolved = providers::resolve_hybrid_target_from_config(
+            &config.hybrid,
+            decision.target,
+            config.api_key.as_deref(),
+        )?;
+        (
+            providers::create_hybrid_target_provider_from_resolved(
+                &resolved,
+                &config.reliability,
+                &provider_runtime_options,
+            )?,
+            decision.provider_name,
+            decision.model,
+        )
+    } else {
+        (
+            providers::create_runtime_provider_from_config_with_options(
+                &config,
+                config.default_provider.as_deref().unwrap_or("openrouter"),
+                config
+                    .default_model
+                    .as_deref()
+                    .unwrap_or("anthropic/claude-sonnet-4"),
+                &provider_runtime_options,
+            )?,
+            config
+                .default_provider
+                .clone()
+                .unwrap_or_else(|| "openrouter".to_string()),
+            config
+                .default_model
+                .clone()
+                .unwrap_or_else(|| "anthropic/claude-sonnet-4".to_string()),
+        )
+    };
+
+    tracing::debug!(
+        provider = provider_name,
+        model = model_name,
+        "Gateway simple chat using pinned provider"
+    );
+    provider
+        .chat_with_history(&prepared.messages, &model_name, state.temperature)
         .await
 }
 
