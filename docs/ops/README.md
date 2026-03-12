@@ -5,6 +5,7 @@ For operators running ZeroClaw in persistent or production-like environments.
 ## Core Operations
 
 - Day-2 runbook: [./operations-runbook.md](./operations-runbook.md)
+- Hybrid testing runbook: [./hybrid-testing-runbook.md](./hybrid-testing-runbook.md)
 - Release runbook: [../contributing/release-process.md](../contributing/release-process.md)
 - Troubleshooting matrix: [./troubleshooting.md](./troubleshooting.md)
 - Safe network/gateway deployment: [./network-deployment.md](./network-deployment.md)
